@@ -1,0 +1,4 @@
+node_modules/
+*.log
+data/notepad.txt
+package-lock.json

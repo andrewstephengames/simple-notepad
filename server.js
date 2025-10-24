@@ -124,7 +124,14 @@ async function handleSave(req, res) {
     // Only write and broadcast if changed
     if (text !== content) {
       content = text;
-      fs.writeFile(DATA_FILE, content, 'utf8', () => {});
+      // Write to disk and, after write completes, update the watcher's snapshot
+      fs.writeFile(DATA_FILE, content, 'utf8', (err) => {
+        // best-effort: update the watcher snapshot so we don't treat this as an external change
+        try {
+          fileWatcher && typeof fileWatcher.setLastSavedContent === 'function' && fileWatcher.setLastSavedContent(content);
+        } catch {}
+      });
+      // Broadcast to clients immediately (in-memory is authoritative until disk proves otherwise)
       broadcast('content', { content });
     }
 
@@ -134,6 +141,19 @@ async function handleSave(req, res) {
     res.writeHead(400, { 'Content-Type': 'text/plain' });
     res.end('Bad Request');
   }
+}
+
+function serveText(res) {
+  // Return the persisted text/plain content on disk. If read fails, return empty body.
+  fs.readFile(DATA_FILE, 'utf8', (err, data) => {
+    if (err) {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(data);
+  });
 }
 
 const server = http.createServer((req, res) => {
@@ -159,6 +179,9 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url.pathname === '/content') {
     return serveContent(res);
   }
+  if (req.method === 'GET' && url.pathname === '/text') {
+    return serveText(res);
+  }
   if (req.method === 'POST' && url.pathname === '/save') {
     return handleSave(req, res);
   }
@@ -168,76 +191,94 @@ const server = http.createServer((req, res) => {
   res.end('Not found');
 });
 
-server.listen(PORT, () => {
-  console.log(`Notepad listening at http://localhost:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Notepad listening at http://0.0.0.0:${PORT}`);
 });
 
-// Watch the file for external changes and broadcast updates
+// Watch the file for external changes and broadcast updates.
+// This implementation avoids monkey-patching and instead uses a snapshot
+// of the last content we wrote (`lastSavedContent`) to suppress self-writes,
+// combines `fs.watch` + `fs.watchFile` + directory watch, and debounces events.
 function startFileWatcher() {
   const FILE_NAME = path.basename(DATA_FILE);
   const DIR_NAME = path.dirname(DATA_FILE);
 
-  // Track last self-write to avoid redundant reads immediately after /save
-  let lastSelfWriteAt = 0;
-  const SELF_WRITE_SILENCE_MS = 400; // within this window, ignore watcher events
+  // Snapshot of the last content we intentionally saved to disk.
+  // Updated by handleSave when we write to disk.
+  let lastSavedContent = content;
 
-  // Monkey-patch write to note self-writes (without changing behavior)
-  const originalWriteFile = fs.writeFile;
-  fs.writeFile = function patchedWriteFile(file, data, options, cb) {
-    // Normalize optional args
-    if (typeof options === 'function') {
-      cb = options; // eslint-disable-line no-param-reassign
-      options = undefined; // eslint-disable-line no-param-reassign
-    }
-    if (file === DATA_FILE) {
-      lastSelfWriteAt = Date.now();
-    }
-    return originalWriteFile.call(fs, file, data, options, cb);
-  };
-
-  // Debounced reload from disk
+  // Debounce timer
   let debounceTimer = null;
-  async function reloadFromDisk(reason) {
-    // Ignore shortly after our own writes
-    if (Date.now() - lastSelfWriteAt < SELF_WRITE_SILENCE_MS) return;
-    let disk = '';
-    try {
-      disk = fs.readFileSync(DATA_FILE, 'utf8');
-    } catch {
-      // If deleted or unreadable, treat as empty
-      disk = '';
-    }
-    if (disk !== content) {
-      content = disk;
-      broadcast('content', { content });
-    }
-  }
-
   function scheduleReload(reason) {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => reloadFromDisk(reason), 120);
   }
 
-  // 1) Polling watcher is very reliable across editors and atomic renames
-  fs.watchFile(DATA_FILE, { interval: 300 }, (curr, prev) => {
-    if (curr.mtimeMs !== prev.mtimeMs || curr.size !== prev.size) {
-      scheduleReload('stat-change');
+  function reloadFromDisk(reason) {
+    let disk = '';
+    try {
+      disk = fs.readFileSync(DATA_FILE, 'utf8');
+    } catch {
+      disk = '';
     }
-  });
 
-  // 2) Event watcher on the directory to catch renames/creates/deletes
+    // If the disk content equals what we last saved, ignore (self-write).
+    if (disk === lastSavedContent) return;
+
+    // If the disk content is different from in-memory content, update and broadcast.
+    if (disk !== content) {
+      content = disk;
+      lastSavedContent = disk;
+      broadcast('content', { content });
+    }
+  }
+
+  // Always use polling as a reliable baseline (works with atomic rename editors)
+  try {
+    fs.watchFile(DATA_FILE, { interval: 300 }, (curr, prev) => {
+      if (curr.mtimeMs !== prev.mtimeMs || curr.size !== prev.size) {
+        scheduleReload('stat-change');
+      }
+    });
+  } catch (e) {
+    // If watchFile fails (very rare), we still try other watchers below
+  }
+
+  // Watch the file directly if possible (faster notifications)
+  try {
+    let fileWatcher = fs.watch(DATA_FILE, (eventType) => {
+      // eventType: 'change' or 'rename'
+      scheduleReload(`file-${eventType}`);
+      // If file was renamed/replaced, attempt to re-establish the watcher
+      if (eventType === 'rename') {
+        // Close old watcher and re-open after short delay
+        try { fileWatcher.close(); } catch {}
+        setTimeout(() => {
+          try { fileWatcher = fs.watch(DATA_FILE, (t) => scheduleReload(`file-${t}`)); } catch {}
+        }, 200);
+      }
+    });
+    fileWatcher.on('error', () => { /* ignore - fallback to watchFile */ });
+  } catch (e) {
+    // Ignore - fallback to watchFile and dir watch
+  }
+
+  // Watch the directory for create/delete/rename events that affect the file
   try {
     const dirWatcher = fs.watch(DIR_NAME, (eventType, filename) => {
       if (filename && path.basename(filename) === FILE_NAME) {
-        // Any rename/change affecting our file
-        scheduleReload(`fswatch-${eventType}`);
+        scheduleReload(`dir-${eventType}`);
       }
     });
-    // If the directory watcher errors, we still have watchFile as a safety net
     dirWatcher.on('error', () => {/* ignore */});
-  } catch {
-    // If fs.watch fails (rare), the polling watcher remains in effect
+  } catch (e) {
+    // ignore
   }
+
+  // Expose a small helper to allow the save handler to tell the watcher what we wrote.
+  return {
+    setLastSavedContent(text) { lastSavedContent = text; }
+  };
 }
 
-startFileWatcher();
+const fileWatcher = startFileWatcher();
