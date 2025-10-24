@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Notepad</title>
+    <style>
+      html, body {
+        height: 100%;
+        margin: 0;
+      }
+      textarea {
+        box-sizing: border-box;
+        width: 100vw;
+        height: 100vh;
+        border: none;
+        padding: 12px;
+        font: 16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+        resize: none;
+        outline: none;
+      }
+    </style>
+  </head>
+  <body>
+    <textarea id="pad" autofocus spellcheck="false"></textarea>
+    <script>
+      (() => {
+        const pad = document.getElementById('pad');
+        let localVersion = 0;
+        let isApplyingRemote = false;
+        let saveTimer = null;
+
+        async function loadInitial() {
+          try {
+            const res = await fetch('/content', { cache: 'no-store' });
+            const data = await res.json();
+            isApplyingRemote = true;
+            pad.value = data.content || '';
+            isApplyingRemote = false;
+          } catch {}
+        }
+
+        function scheduleSave() {
+          if (isApplyingRemote) return;
+          if (saveTimer) clearTimeout(saveTimer);
+          // debounce 400ms
+          saveTimer = setTimeout(async () => {
+            const text = pad.value;
+            try {
+              await fetch('/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: text })
+              });
+            } catch {}
+          }, 400);
+        }
+
+        pad.addEventListener('input', scheduleSave);
+
+        // SSE for live updates
+        function connectSSE() {
+          const ev = new EventSource('/events');
+          ev.addEventListener('content', (e) => {
+            try {
+              const data = JSON.parse(e.data);
+              const incoming = data.content || '';
+              if (incoming !== pad.value) {
+                const start = pad.selectionStart;
+                const end = pad.selectionEnd;
+                const wasFocused = document.activeElement === pad;
+                isApplyingRemote = true;
+                pad.value = incoming;
+                isApplyingRemote = false;
+                if (wasFocused) {
+                  // Try to keep caret stable
+                  pad.selectionStart = Math.min(start, pad.value.length);
+                  pad.selectionEnd = Math.min(end, pad.value.length);
+                }
+              }
+            } catch {}
+          });
+          ev.onerror = () => {
+            ev.close();
+            setTimeout(connectSSE, 1000);
+          };
+        }
+
+        loadInitial().then(connectSSE);
+
+        // Persist before unload (best-effort)
+        window.addEventListener('beforeunload', () => {
+          if (saveTimer) clearTimeout(saveTimer);
+          navigator.sendBeacon && navigator.sendBeacon('/save', new Blob([JSON.stringify({ content: pad.value })], { type: 'application/json' }));
+        });
+      })();
+    </script>
+  </body>
+  </html>

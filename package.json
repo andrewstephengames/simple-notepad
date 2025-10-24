@@ -1,0 +1,23 @@
+{
+  "name": "simple-notepad",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A super-simple shared notepad with auto-save and no database, served on port 6969.",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "notepad",
+    "sse",
+    "autosave",
+    "node"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
